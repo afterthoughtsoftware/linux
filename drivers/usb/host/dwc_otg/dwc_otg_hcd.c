@@ -40,10 +40,14 @@
  * header file.
  */
 
+#include <linux/usb.h>
+#include <linux/usb/hcd.h>
+
 #include "dwc_otg_hcd.h"
 #include "dwc_otg_regs.h"
+#include "dwc_otg_mphi_fix.h"
 
-extern bool microframe_schedule;
+extern bool microframe_schedule, nak_holdoff_enable;
 
 //#define DEBUG_HOST_CHANNELS
 #ifdef DEBUG_HOST_CHANNELS
@@ -54,6 +58,11 @@ static int last_sel_trans_num_avail_hc_at_end = 0;
 #endif /* DEBUG_HOST_CHANNELS */
 
 extern int g_next_sched_frame, g_np_count, g_np_sent;
+
+extern haint_data_t haint_saved;
+extern hcintmsk_data_t hcintmsk_saved[MAX_EPS_CHANNELS];
+extern hcint_data_t hcint_saved[MAX_EPS_CHANNELS];
+extern gintsts_data_t ginsts_saved;
 
 dwc_otg_hcd_t *dwc_otg_hcd_alloc_hcd(void)
 {
@@ -164,31 +173,43 @@ static void del_timers(dwc_otg_hcd_t * hcd)
 
 /**
  * Processes all the URBs in a single list of QHs. Completes them with
- * -ETIMEDOUT and frees the QTD.
+ * -ESHUTDOWN and frees the QTD.
  */
 static void kill_urbs_in_qh_list(dwc_otg_hcd_t * hcd, dwc_list_link_t * qh_list)
 {
-	dwc_list_link_t *qh_item;
+	dwc_list_link_t *qh_item, *qh_tmp;
 	dwc_otg_qh_t *qh;
 	dwc_otg_qtd_t *qtd, *qtd_tmp;
 
-	DWC_LIST_FOREACH(qh_item, qh_list) {
+	DWC_LIST_FOREACH_SAFE(qh_item, qh_tmp, qh_list) {
 		qh = DWC_LIST_ENTRY(qh_item, dwc_otg_qh_t, qh_list_entry);
 		DWC_CIRCLEQ_FOREACH_SAFE(qtd, qtd_tmp,
 					 &qh->qtd_list, qtd_list_entry) {
 			qtd = DWC_CIRCLEQ_FIRST(&qh->qtd_list);
 			if (qtd->urb != NULL) {
 				hcd->fops->complete(hcd, qtd->urb->priv,
-						    qtd->urb, -DWC_E_TIMEOUT);
+						    qtd->urb, -DWC_E_SHUTDOWN);
 				dwc_otg_hcd_qtd_remove_and_free(hcd, qtd, qh);
 			}
 
 		}
+		if(qh->channel) {
+			/* Using hcchar.chen == 1 is not a reliable test.
+			 * It is possible that the channel has already halted
+			 * but not yet been through the IRQ handler.
+			 */
+			dwc_otg_hc_halt(hcd->core_if, qh->channel,
+				DWC_OTG_HC_XFER_URB_DEQUEUE);
+			if(microframe_schedule)
+				hcd->available_host_channels++;
+			qh->channel = NULL;
+		}
+		dwc_otg_hcd_qh_remove(hcd, qh);
 	}
 }
 
 /**
- * Responds with an error status of ETIMEDOUT to all URBs in the non-periodic
+ * Responds with an error status of ESHUTDOWN to all URBs in the non-periodic
  * and periodic schedules. The QTD associated with each URB is removed from
  * the schedule and freed. This function may be called when a disconnect is
  * detected or when the HCD is being stopped.
@@ -274,7 +295,8 @@ static int32_t dwc_otg_hcd_disconnect_cb(void *p)
 	 */
 	dwc_otg_hcd->flags.b.port_connect_status_change = 1;
 	dwc_otg_hcd->flags.b.port_connect_status = 0;
-
+	if(fiq_fix_enable)
+		local_fiq_disable();
 	/*
 	 * Shutdown any transfers in process by clearing the Tx FIFO Empty
 	 * interrupt mask and status bits and disabling subsequent host
@@ -370,7 +392,21 @@ static int32_t dwc_otg_hcd_disconnect_cb(void *p)
 				channel->qh = NULL;
 			}
 		}
+		if(fiq_split_enable) {
+			for(i=0; i < 128; i++) {
+				dwc_otg_hcd->hub_port[i] = 0;
+			}
+			haint_saved.d32 = 0;
+			for(i=0; i < MAX_EPS_CHANNELS; i++) {
+				hcint_saved[i].d32 = 0;
+				hcintmsk_saved[i].d32 = 0;
+			}
+		}
+
 	}
+
+	if(fiq_fix_enable)
+		local_fiq_enable();
 
 	if (dwc_otg_hcd->fops->disconnect) {
 		dwc_otg_hcd->fops->disconnect(dwc_otg_hcd);
@@ -460,12 +496,12 @@ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t * hcd,
 			    dwc_otg_hcd_urb_t * dwc_otg_urb, void **ep_handle,
 			    int atomic_alloc)
 {
-	dwc_irqflags_t flags;
 	int retval = 0;
 	uint8_t needs_scheduling = 0;
 	dwc_otg_transaction_type_e tr_type;
 	dwc_otg_qtd_t *qtd;
 	gintmsk_data_t intr_mask = {.d32 = 0 };
+	hprt0_data_t hprt0 = { .d32 = 0 };
 
 #ifdef DEBUG /* integrity checks (Broadcom) */
 	if (NULL == hcd->core_if) {
@@ -478,6 +514,16 @@ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t * hcd,
 		/* No longer connected. */
 		DWC_ERROR("Not connected\n");
 		return -DWC_E_NO_DEVICE;
+	}
+
+	/* Some core configurations cannot support LS traffic on a FS root port */
+	if ((hcd->fops->speed(hcd, dwc_otg_urb->priv) == USB_SPEED_LOW) &&
+		(hcd->core_if->hwcfg2.b.fs_phy_type == 1) &&
+		(hcd->core_if->hwcfg2.b.hs_phy_type == 1)) {
+			hprt0.d32 = DWC_READ_REG32(hcd->core_if->host_if->hprt0);
+			if (hprt0.b.prtspd == DWC_HPRT0_PRTSPD_FULL_SPEED) {
+				return -DWC_E_NO_DEVICE;
+			}
 	}
 
 	qtd = dwc_otg_hcd_qtd_create(dwc_otg_urb, atomic_alloc);
@@ -511,12 +557,10 @@ int dwc_otg_hcd_urb_enqueue(dwc_otg_hcd_t * hcd,
 	}
 
 	if(needs_scheduling) {
-		DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
 		tr_type = dwc_otg_hcd_select_transactions(hcd);
 		if (tr_type != DWC_OTG_TRANSACTION_NONE) {
 			dwc_otg_hcd_queue_transactions(hcd, tr_type);
 		}
-		DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
 	}
 	return retval;
 }
@@ -578,6 +622,8 @@ int dwc_otg_hcd_urb_dequeue(dwc_otg_hcd_t * hcd,
 			 */
 			dwc_otg_hc_halt(hcd->core_if, qh->channel,
 					DWC_OTG_HC_XFER_URB_DEQUEUE);
+
+			dwc_otg_hcd_release_port(hcd, qh);
 		}
 	}
 
@@ -692,6 +738,33 @@ static void reset_tasklet_func(void *data)
 	hprt0.b.prtrst = 0;
 	DWC_WRITE_REG32(core_if->host_if->hprt0, hprt0.d32);
 	dwc_otg_hcd->flags.b.port_reset_change = 1;
+}
+
+static void completion_tasklet_func(void *ptr)
+{
+	dwc_otg_hcd_t *hcd = (dwc_otg_hcd_t *) ptr;
+	struct urb *urb;
+	urb_tq_entry_t *item;
+	dwc_irqflags_t flags;
+
+	/* This could just be spin_lock_irq */
+	DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+	while (!DWC_TAILQ_EMPTY(&hcd->completed_urb_list)) {
+		item = DWC_TAILQ_FIRST(&hcd->completed_urb_list);
+		urb = item->urb;
+		DWC_TAILQ_REMOVE(&hcd->completed_urb_list, item,
+				urb_tq_entries);
+		DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
+		DWC_FREE(item);
+
+		usb_hcd_giveback_urb(hcd->priv, urb, urb->status);
+
+		fiq_print(FIQDBG_PORTHUB, "COMPLETE");
+
+		DWC_SPINLOCK_IRQSAVE(hcd->lock, &flags);
+	}
+	DWC_SPINUNLOCK_IRQRESTORE(hcd->lock, flags);
+	return;
 }
 
 static void qh_list_free(dwc_otg_hcd_t * hcd, dwc_list_link_t * qh_list)
@@ -833,6 +906,7 @@ static void dwc_otg_hcd_free(dwc_otg_hcd_t * dwc_otg_hcd)
 
 	DWC_TIMER_FREE(dwc_otg_hcd->conn_timer);
 	DWC_TASK_FREE(dwc_otg_hcd->reset_tasklet);
+	DWC_TASK_FREE(dwc_otg_hcd->completion_tasklet);
 
 #ifdef DWC_DEV_SRPCAP
 	if (dwc_otg_hcd->core_if->power_down == 2 &&
@@ -877,7 +951,7 @@ int dwc_otg_hcd_init(dwc_otg_hcd_t * hcd, dwc_otg_core_if_t * core_if)
 	DWC_LIST_INIT(&hcd->periodic_sched_ready);
 	DWC_LIST_INIT(&hcd->periodic_sched_assigned);
 	DWC_LIST_INIT(&hcd->periodic_sched_queued);
-
+	DWC_TAILQ_INIT(&hcd->completed_urb_list);
 	/*
 	 * Create a host channel descriptor for each host channel implemented
 	 * in the controller. Initialize the channel descriptor array.
@@ -915,6 +989,9 @@ int dwc_otg_hcd_init(dwc_otg_hcd_t * hcd, dwc_otg_core_if_t * core_if)
 
 	/* Initialize reset tasklet. */
 	hcd->reset_tasklet = DWC_TASK_ALLOC("reset_tasklet", reset_tasklet_func, hcd);
+
+	hcd->completion_tasklet = DWC_TASK_ALLOC("completion_tasklet",
+						completion_tasklet_func, hcd);
 #ifdef DWC_DEV_SRPCAP
 	if (hcd->core_if->power_down == 2) {
 		/* Initialize Power on timer for Host power up in case hibernation */
@@ -947,6 +1024,12 @@ int dwc_otg_hcd_init(dwc_otg_hcd_t * hcd, dwc_otg_core_if_t * core_if)
 	hcd->frame_list = NULL;
 	hcd->frame_list_dma = 0;
 	hcd->periodic_qh_count = 0;
+
+	DWC_MEMSET(hcd->hub_port, 0, sizeof(hcd->hub_port));
+#ifdef FIQ_DEBUG
+	DWC_MEMSET(hcd->hub_port_alloc, -1, sizeof(hcd->hub_port_alloc));
+#endif
+
 out:
 	return retval;
 }
@@ -1092,7 +1175,12 @@ static void assign_and_init_hc(dwc_otg_hcd_t * hcd, dwc_otg_qh_t * qh)
 		uint32_t hub_addr, port_addr;
 		hc->do_split = 1;
 		hc->xact_pos = qtd->isoc_split_pos;
-		hc->complete_split = qtd->complete_split;
+		/* We don't need to do complete splits anymore */
+		if(fiq_split_enable)
+			hc->complete_split = qtd->complete_split = 0;
+		else
+			hc->complete_split = qtd->complete_split;
+
 		hcd->fops->hub_info(hcd, urb->priv, &hub_addr, &port_addr);
 		hc->hub_addr = (uint8_t) hub_addr;
 		hc->port_addr = (uint8_t) port_addr;
@@ -1239,6 +1327,65 @@ static void assign_and_init_hc(dwc_otg_hcd_t * hcd, dwc_otg_qh_t * qh)
 	hc->qh = qh;
 }
 
+/*
+** Check the transaction to see if the port / hub has already been assigned for
+** a split transaction
+**
+** Return 0 - Port is already in use
+*/
+int dwc_otg_hcd_allocate_port(dwc_otg_hcd_t * hcd, dwc_otg_qh_t *qh)
+{
+	uint32_t hub_addr, port_addr;
+
+	if(!fiq_split_enable)
+		return 0;
+
+	hcd->fops->hub_info(hcd, DWC_CIRCLEQ_FIRST(&qh->qtd_list)->urb->priv, &hub_addr, &port_addr);
+
+	if(hcd->hub_port[hub_addr] & (1 << port_addr))
+	{
+		fiq_print(FIQDBG_PORTHUB, "H%dP%d:S%02d", hub_addr, port_addr, qh->skip_count);
+
+		qh->skip_count++;
+
+		if(qh->skip_count > 40000)
+		{
+			printk_once(KERN_ERR "Error: Having to skip port allocation");
+			local_fiq_disable();
+			BUG();
+			return 0;
+		}
+		return 1;
+	}
+	else
+	{
+		qh->skip_count = 0;
+		hcd->hub_port[hub_addr] |= 1 << port_addr;
+		fiq_print(FIQDBG_PORTHUB, "H%dP%d:A %d", hub_addr, port_addr, DWC_CIRCLEQ_FIRST(&qh->qtd_list)->urb->pipe_info.ep_num);
+#ifdef FIQ_DEBUG
+		hcd->hub_port_alloc[hub_addr * 16 + port_addr] = dwc_otg_hcd_get_frame_number(hcd);
+#endif
+		return 0;
+	}
+}
+void dwc_otg_hcd_release_port(dwc_otg_hcd_t * hcd, dwc_otg_qh_t *qh)
+{
+	uint32_t hub_addr, port_addr;
+
+	if(!fiq_split_enable)
+		return;
+
+	hcd->fops->hub_info(hcd, DWC_CIRCLEQ_FIRST(&qh->qtd_list)->urb->priv, &hub_addr, &port_addr);
+
+	hcd->hub_port[hub_addr] &= ~(1 << port_addr);
+#ifdef FIQ_DEBUG
+	hcd->hub_port_alloc[hub_addr * 16 + port_addr] = -1;
+#endif
+	fiq_print(FIQDBG_PORTHUB, "H%dP%d:RO%d", hub_addr, port_addr, DWC_CIRCLEQ_FIRST(&qh->qtd_list)->urb->pipe_info.ep_num);
+
+}
+
+
 /**
  * This function selects transactions from the HCD transfer schedule and
  * assigns them to available host channels. It is called from HCD interrupt
@@ -1252,6 +1399,7 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 {
 	dwc_list_link_t *qh_ptr;
 	dwc_otg_qh_t *qh;
+	dwc_otg_qtd_t *qtd;
 	int num_channels;
 	dwc_irqflags_t flags;
 	dwc_spinlock_t *channel_lock = hcd->channel_lock;
@@ -1272,11 +1420,29 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 
 	while (qh_ptr != &hcd->periodic_sched_ready &&
 	       !DWC_CIRCLEQ_EMPTY(&hcd->free_hc_list)) {
+
+		qh = DWC_LIST_ENTRY(qh_ptr, dwc_otg_qh_t, qh_list_entry);
+
+		if(qh->do_split) {
+			qtd = DWC_CIRCLEQ_FIRST(&qh->qtd_list);
+			if(!(qh->ep_type == UE_ISOCHRONOUS &&
+					(qtd->isoc_split_pos == DWC_HCSPLIT_XACTPOS_MID ||
+					qtd->isoc_split_pos == DWC_HCSPLIT_XACTPOS_END))) {
+				if(dwc_otg_hcd_allocate_port(hcd, qh))
+				{
+					qh_ptr = DWC_LIST_NEXT(qh_ptr);
+					g_next_sched_frame = dwc_frame_num_inc(dwc_otg_hcd_get_frame_number(hcd), 1);
+					continue;
+				}
+			}
+		}
+
 		if (microframe_schedule) {
 			// Make sure we leave one channel for non periodic transactions.
 			DWC_SPINLOCK_IRQSAVE(channel_lock, &flags);
 			if (hcd->available_host_channels <= 1) {
 				DWC_SPINUNLOCK_IRQRESTORE(channel_lock, flags);
+				if(qh->do_split) dwc_otg_hcd_release_port(hcd, qh);
 				break;
 			}
 			hcd->available_host_channels--;
@@ -1297,8 +1463,6 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 		DWC_LIST_MOVE_HEAD(&hcd->periodic_sched_assigned,
 				   &qh->qh_list_entry);
 		DWC_SPINUNLOCK_IRQRESTORE(channel_lock, flags);
-
-		ret_val = DWC_OTG_TRANSACTION_PERIODIC;
 	}
 
 	/*
@@ -1317,17 +1481,26 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 
 		/*
 		 * Check to see if this is a NAK'd retransmit, in which case ignore for retransmission
-		 * we hold off on bulk retransmissions to reduce NAK interrupt overhead for
+		 * we hold off on bulk retransmissions to reduce NAK interrupt overhead for full-speed
 		 * cheeky devices that just hold off using NAKs
 		 */
-		if (dwc_full_frame_num(qh->nak_frame) == dwc_full_frame_num(dwc_otg_hcd_get_frame_number(hcd))) {
-			// Make fiq interrupt run on next frame (i.e. 8 uframes)
-			g_next_sched_frame = ((qh->nak_frame + 8) & ~7) & DWC_HFNUM_MAX_FRNUM;
-			qh_ptr = DWC_LIST_NEXT(qh_ptr);
-			continue;
+		if (nak_holdoff_enable && qh->do_split) {
+			if (qh->nak_frame != 0xffff &&
+				dwc_full_frame_num(qh->nak_frame) ==
+				dwc_full_frame_num(dwc_otg_hcd_get_frame_number(hcd))) {
+				/*
+				 * Revisit: Need to avoid trampling on periodic scheduling.
+				 * Currently we are safe because g_np_count != g_np_sent whenever we hit this,
+				 * but if this behaviour is changed then periodic endpoints will get a slower
+				 * polling rate.
+				 */
+				g_next_sched_frame = ((qh->nak_frame + 8) & ~7) & DWC_HFNUM_MAX_FRNUM;
+				qh_ptr = DWC_LIST_NEXT(qh_ptr);
+				continue;
+			} else {
+				qh->nak_frame = 0xffff;
+			}
 		}
-		else
-			qh->nak_frame = 0xffff;
 
 		if (microframe_schedule) {
 				DWC_SPINLOCK_IRQSAVE(channel_lock, &flags);
@@ -1356,15 +1529,16 @@ dwc_otg_transaction_type_e dwc_otg_hcd_select_transactions(dwc_otg_hcd_t * hcd)
 
 		g_np_sent++;
 
-		if (ret_val == DWC_OTG_TRANSACTION_NONE) {
-			ret_val = DWC_OTG_TRANSACTION_NON_PERIODIC;
-		} else {
-			ret_val = DWC_OTG_TRANSACTION_ALL;
-		}
-
 		if (!microframe_schedule)
 			hcd->non_periodic_channels++;
 	}
+
+	if(!DWC_LIST_EMPTY(&hcd->periodic_sched_assigned))
+		ret_val |= DWC_OTG_TRANSACTION_PERIODIC;
+
+	if(!DWC_LIST_EMPTY(&hcd->non_periodic_sched_active))
+		ret_val |= DWC_OTG_TRANSACTION_NON_PERIODIC;
+
 
 #ifdef DEBUG_HOST_CHANNELS
 	last_sel_trans_num_avail_hc_at_end = hcd->available_host_channels;
@@ -1481,6 +1655,15 @@ static void process_periodic_channels(dwc_otg_hcd_t * hcd)
 		}
 
 		qh = DWC_LIST_ENTRY(qh_ptr, dwc_otg_qh_t, qh_list_entry);
+
+		// Do not send a split start transaction any later than frame .6
+		// Note, we have to schedule a periodic in .5 to make it go in .6
+		if(fiq_split_enable && qh->do_split && ((dwc_otg_hcd_get_frame_number(hcd) + 1) & 7) > 6)
+		{
+			qh_ptr = qh_ptr->next;
+			g_next_sched_frame = dwc_otg_hcd_get_frame_number(hcd) | 7;
+			continue;
+		}
 
 		/*
 		 * Set a flag if we're queuing high-bandwidth in slave mode.
@@ -1611,6 +1794,15 @@ static void process_non_periodic_channels(dwc_otg_hcd_t * hcd)
 
 		qh = DWC_LIST_ENTRY(hcd->non_periodic_qh_ptr, dwc_otg_qh_t,
 				    qh_list_entry);
+
+		// Do not send a split start transaction any later than frame .5
+		// non periodic transactions will start immediately in this uframe
+		if(fiq_split_enable && qh->do_split && ((dwc_otg_hcd_get_frame_number(hcd) + 1) & 7) > 6)
+		{
+			g_next_sched_frame = dwc_otg_hcd_get_frame_number(hcd) | 7;
+			break;
+		}
+
 		status =
 		    queue_transaction(hcd, qh->channel,
 				      tx_status.b.nptxfspcavail);

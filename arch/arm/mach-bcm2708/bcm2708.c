@@ -83,6 +83,7 @@
 /* command line parameters */
 static unsigned boardrev, serial;
 static unsigned uart_clock;
+static unsigned reboot_part = 0;
 
 static void __init bcm2708_init_led(void);
 
@@ -366,7 +367,7 @@ static struct resource bcm2708_usb_resources[] = {
 	       },
 };
 
-extern bool fiq_fix_enable;
+bool fiq_fix_enable = true;
 
 static struct resource bcm2708_usb_resources_no_fiq_fix[] = {
 	[0] = {
@@ -585,7 +586,7 @@ static struct platform_device bcm2708_spi_device = {
 	.resource = bcm2708_spi_resources,
 };
 
-#ifdef CONFIG_SPI
+#ifdef CONFIG_BCM2708_SPIDEV
 static struct spi_board_info bcm2708_spi_devices[] = {
 	{
 		.modalias = "spidev",
@@ -662,10 +663,41 @@ int __init bcm_register_device(struct platform_device *pdev)
 	return ret;
 }
 
+int calc_rsts(int partition)
+{
+	return PM_PASSWORD |
+		((partition & (1 << 0))  << 0) |
+		((partition & (1 << 1))  << 1) |
+		((partition & (1 << 2))  << 2) |
+		((partition & (1 << 3))  << 3) |
+		((partition & (1 << 4))  << 4) |
+		((partition & (1 << 5))  << 5);
+}
+
 static void bcm2708_restart(char mode, const char *cmd)
 {
 	uint32_t pm_rstc, pm_wdog;
 	uint32_t timeout = 10;
+	uint32_t pm_rsts = 0;
+
+	if(mode == 'q')
+	{
+		// NOOBS < 1.3 booting with reboot=q
+		pm_rsts = readl(__io_address(PM_RSTS));
+		pm_rsts = PM_PASSWORD | pm_rsts | PM_RSTS_HADWRQ_SET;
+	}
+	else if(mode == 'p')
+	{
+		// NOOBS < 1.3 halting
+		pm_rsts = readl(__io_address(PM_RSTS));
+		pm_rsts = PM_PASSWORD | pm_rsts | PM_RSTS_HADWRH_SET;
+	}
+	else
+	{
+		pm_rsts = calc_rsts(reboot_part);
+	}
+
+	writel(pm_rsts, __io_address(PM_RSTS));
 
 	/* Setup watchdog for reset */
 	pm_rstc = readl(IO_ADDRESS(PM_RSTC));
@@ -680,12 +712,20 @@ static void bcm2708_restart(char mode, const char *cmd)
 /* We can't really power off, but if we do the normal reset scheme, and indicate to bootcode.bin not to reboot, then most of the chip will be powered off */
 static void bcm2708_power_off(void)
 {
-	/* we set the watchdog hard reset bit here to distinguish this reset from the normal (full) reset. bootcode.bin will not reboot after a hard reset */
-	uint32_t pm_rsts = readl(IO_ADDRESS(PM_RSTS));
-	pm_rsts = PM_PASSWORD | (pm_rsts & PM_RSTC_WRCFG_CLR) | PM_RSTS_HADWRH_SET;
-	writel(pm_rsts, IO_ADDRESS(PM_RSTS));
-	/* continue with normal reset mechanism */
-	bcm2708_restart(0, "");
+	extern char reboot_mode;
+
+	if(reboot_mode == 'q')
+	{
+		// NOOBS < v1.3
+		bcm2708_restart('p', "");
+	}
+	else
+	{
+		/* partition 63 is special code for HALT the bootloader knows not to boot*/
+		reboot_part = 63;
+		/* continue with normal reset mechanism */
+		bcm2708_restart(0, "");
+	}
 }
 
 void __init bcm2708_init(void)
@@ -747,7 +787,7 @@ void __init bcm2708_init(void)
 	system_rev = boardrev;
 	system_serial_low = serial;
 
-#ifdef CONFIG_SPI
+#ifdef CONFIG_BCM2708_SPIDEV
 	spi_register_board_info(bcm2708_spi_devices,
 			ARRAY_SIZE(bcm2708_spi_devices));
 #endif
@@ -945,3 +985,4 @@ MACHINE_END
 module_param(boardrev, uint, 0644);
 module_param(serial, uint, 0644);
 module_param(uart_clock, uint, 0644);
+module_param(reboot_part, uint, 0644);

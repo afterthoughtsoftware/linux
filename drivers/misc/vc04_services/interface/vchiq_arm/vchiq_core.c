@@ -273,6 +273,9 @@ unlock_service(VCHIQ_SERVICE_T *service)
 	}
 	spin_unlock(&service_spinlock);
 
+	if (service && service->userdata_term)
+		service->userdata_term(service->base.userdata);
+
 	kfree(service);
 }
 
@@ -850,7 +853,7 @@ queue_message(VCHIQ_STATE_T *state, VCHIQ_SERVICE_T *service,
 						VCHIQ_LOG_INFO)
 						vchiq_log_dump_mem("Sent", 0,
 							header->data + pos,
-							min(64,
+							min(64u,
 							elements[0].size));
 				}
 			}
@@ -998,7 +1001,7 @@ queue_message_sync(VCHIQ_STATE_T *state, VCHIQ_SERVICE_T *service,
 						VCHIQ_LOG_TRACE)
 						vchiq_log_dump_mem("Sent Sync",
 							0, header->data + pos,
-							min(64,
+							min(64u,
 							elements[0].size));
 				}
 			}
@@ -2476,7 +2479,7 @@ vchiq_init_state(VCHIQ_STATE_T *state, VCHIQ_SLOT_ZERO_T *slot_zero,
 VCHIQ_SERVICE_T *
 vchiq_add_service_internal(VCHIQ_STATE_T *state,
 	const VCHIQ_SERVICE_PARAMS_T *params, int srvstate,
-	VCHIQ_INSTANCE_T instance)
+	VCHIQ_INSTANCE_T instance, VCHIQ_USERDATA_TERM_T userdata_term)
 {
 	VCHIQ_SERVICE_T *service;
 
@@ -2488,6 +2491,7 @@ vchiq_add_service_internal(VCHIQ_STATE_T *state,
 		service->handle        = VCHIQ_SERVICE_HANDLE_INVALID;
 		service->ref_count     = 1;
 		service->srvstate      = VCHIQ_SRVSTATE_FREE;
+		service->userdata_term = userdata_term;
 		service->localport     = VCHIQ_PORT_FREE;
 		service->remoteport    = VCHIQ_PORT_FREE;
 
@@ -3307,7 +3311,7 @@ error_exit:
 
 VCHIQ_STATUS_T
 vchiq_queue_message(VCHIQ_SERVICE_HANDLE_T handle,
-	const VCHIQ_ELEMENT_T *elements, int count)
+	const VCHIQ_ELEMENT_T *elements, unsigned int count)
 {
 	VCHIQ_SERVICE_T *service = find_service_by_handle(handle);
 	VCHIQ_STATUS_T status = VCHIQ_ERROR;
